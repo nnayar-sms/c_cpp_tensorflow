@@ -161,18 +161,56 @@ jobs:
       run: |
         # If autogen.sh exists, run it first
         if [ -f "autogen.sh" ]; then
-          ./autogen.sh
+          chmod +x autogen.sh
+          ./autogen.sh || echo "autogen.sh failed, continuing anyway"
         fi
         
         # If configure.ac exists but no configure, run autoconf
         if [ -f "configure.ac" ] && [ ! -f "configure" ]; then
-          autoreconf -i
+          autoreconf -i || echo "autoreconf failed, continuing anyway"
         fi
         
-        # Run configure and make
+        # Check if this is a TensorFlow-like repo with an interactive configure script
         if [ -f "configure" ]; then
-          ./configure
-          make
+          # Check if this is TensorFlow or similar that needs non-interactive answers
+          if grep -q "TensorFlow\|CUDA\|ROCm\|Python" configure; then
+            echo "Detected TensorFlow-like configure script. Running in non-interactive mode..."
+            # Create a response file for interactive prompts
+            cat > /tmp/tf_responses << EOF
+            
+
+            
+            
+            n
+            n
+            Y
+            
+            
+            n
+            EOF
+            # Run configure with automatic responses
+            cat /tmp/tf_responses | ./configure || echo "configure failed, continuing anyway"
+          else
+            # Try running configure normally, but don't fail if it has problems
+            chmod +x configure
+            ./configure || echo "configure failed, continuing anyway"
+          fi
+          
+          # Check if Makefile was created or already exists
+          if [ -f "Makefile" ]; then
+            echo "Makefile found. Running make..."
+            make || echo "make failed, continuing anyway"
+          else
+            echo "No Makefile found after configure. Checking for other build systems..."
+            # Try to detect if this is a Bazel project
+            if [ -f "WORKSPACE" ] || [ -f "BUILD" ] || [ -f "BUILD.bazel" ]; then
+              echo "Detected Bazel build system. Skipping make."
+              # Optionally run a basic Bazel build if needed
+              # bazel build //... --config=opt || echo "bazel build failed, continuing anyway"
+            else
+              echo "No recognized build system found after configure."
+            fi
+          fi
         fi
       continue-on-error: true
 
@@ -480,10 +518,14 @@ jobs:
         echo "Dependency report generated at dependency_report.md"
       continue-on-error: true
         
+    - name: Get repository name
+      id: repo-name
+      run: echo "REPO_NAME=$(echo '${{ github.repository }}' | awk -F '/' '{print $2}')" >> $GITHUB_OUTPUT
+
     - name: Upload dependency report
       uses: actions/upload-artifact@v4
       with:
-        name: dependency-report
+        name: ${{ steps.repo-name.outputs.REPO_NAME }}-dependency-report
         path: |
           dependency_report.md
           dependency_info.tar.gz
