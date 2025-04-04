@@ -1,0 +1,489 @@
+name: C/C++ Build (Ubuntu)
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master, develop ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Ubuntu Build
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Install basic build tools
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential cmake ninja-build pkg-config
+
+    - name: Auto-detect and install dependencies
+      run: |
+        # If a dependencies.txt file exists, use it to install dependencies
+        if [ -f "dependencies.txt" ]; then
+          sudo apt-get install -y $(cat dependencies.txt)
+        fi
+        
+        # If there's a CMake file, extract and install dependencies
+        if [ -f "CMakeLists.txt" ]; then
+          # Extract package dependencies from CMake files
+          CMAKE_DEPS=$(grep -E "find_package|pkg_check_modules" CMakeLists.txt | grep -oE '[A-Za-z0-9_-]+' | sort | uniq)
+          if [ ! -z "$CMAKE_DEPS" ]; then
+            echo "Detected CMake dependencies: $CMAKE_DEPS"
+            # Try to install common mappings from CMake module names to apt package names
+            for DEP in $CMAKE_DEPS; do
+              case $DEP in
+                Boost)
+                  sudo apt-get install -y libboost-all-dev
+                  ;;
+                ZLIB)
+                  sudo apt-get install -y zlib1g-dev
+                  ;;
+                OpenSSL)
+                  sudo apt-get install -y libssl-dev
+                  ;;
+                Threads)
+                  # Usually built-in
+                  ;;
+                Qt5|Qt6)
+                  sudo apt-get install -y qtbase5-dev
+                  ;;
+                CURL)
+                  sudo apt-get install -y libcurl4-openssl-dev
+                  ;;
+                *)
+                  # Try to guess package name (lowercase with lib prefix and -dev suffix)
+                  GUESS_PKG="lib$(echo $DEP | tr '[:upper:]' '[:lower:]')-dev"
+                  echo "Trying to install: $GUESS_PKG"
+                  sudo apt-get install -y $GUESS_PKG || true
+                  ;;
+              esac
+            done
+          fi
+        fi
+        
+        # If configure script exists, check for dependencies
+        if [ -f "configure" ]; then
+          # Run configure with --help to extract dependencies
+          CONFIGURE_DEPS=$(./configure --help | grep -E 'with-[a-z0-9_-]+' | grep -oE 'with-[a-z0-9_-]+' | sed 's/with-//g')
+          if [ ! -z "$CONFIGURE_DEPS" ]; then
+            echo "Detected configure dependencies: $CONFIGURE_DEPS"
+            # Try to install based on common naming patterns
+            for DEP in $CONFIGURE_DEPS; do
+              GUESS_PKG="lib$(echo $DEP | tr '[:upper:]' '[:lower:]')-dev"
+              echo "Trying to install: $GUESS_PKG"
+              sudo apt-get install -y $GUESS_PKG || true
+            done
+          fi
+        fi
+        
+        # If vcpkg.json exists, extract dependencies
+        if [ -f "vcpkg.json" ]; then
+          VCPKG_DEPS=$(grep -Eo '"dependencies"[^]]*]' vcpkg.json | grep -Eo '"[^"]*"' | sed 's/"//g' | grep -v dependencies)
+          if [ ! -z "$VCPKG_DEPS" ]; then
+            echo "Detected vcpkg dependencies: $VCPKG_DEPS"
+            # Try to map vcpkg package names to apt packages
+            for DEP in $VCPKG_DEPS; do
+              GUESS_PKG="lib$(echo $DEP | tr '[:upper:]' '[:lower:]')-dev"
+              echo "Trying to install: $GUESS_PKG"
+              sudo apt-get install -y $GUESS_PKG || true
+            done
+          fi
+        fi
+        
+        # If conanfile.txt or conanfile.py exists, use Conan to handle dependencies
+        if [ -f "conanfile.txt" ] || [ -f "conanfile.py" ]; then
+          echo "Conan package manager detected, installing Conan..."
+          pip install conan
+          # Conan will handle the dependencies during the build step
+        fi
+
+    - name: Check build system
+      id: check_build
+      run: |
+        # Check for different build systems and set outputs accordingly
+        if [ -f "CMakeLists.txt" ]; then
+          echo "HAS_CMAKE=true" >> $GITHUB_OUTPUT
+        else
+          echo "HAS_CMAKE=false" >> $GITHUB_OUTPUT
+          echo "No CMakeLists.txt found in root directory. Will skip CMake build."
+        fi
+        
+        if [ -f "configure" ] || [ -f "configure.ac" ] || [ -f "autogen.sh" ]; then
+          echo "HAS_AUTOTOOLS=true" >> $GITHUB_OUTPUT
+        else
+          echo "HAS_AUTOTOOLS=false" >> $GITHUB_OUTPUT
+        fi
+        
+        if [ -f "Makefile" ] || [ -f "makefile" ] || [ -f "GNUmakefile" ]; then
+          echo "HAS_MAKEFILE=true" >> $GITHUB_OUTPUT
+        else
+          echo "HAS_MAKEFILE=false" >> $GITHUB_OUTPUT
+        fi
+        
+        # Create build directory regardless of build system
+        mkdir -p build
+
+    - name: Configure and build with CMake
+      if: steps.check_build.outputs.HAS_CMAKE == 'true'
+      run: |
+        cd build
+        
+        # If using Conan, install dependencies first
+        if [ -f "../conanfile.txt" ] || [ -f "../conanfile.py" ]; then
+          conan install .. --build=missing
+        fi
+        
+        # Find CMakeLists.txt location (it might be in a subdirectory)
+        CMAKE_DIR=".."
+        if [ ! -f "../CMakeLists.txt" ]; then
+          # Try to find the directory containing CMakeLists.txt
+          CMAKE_DIR_FOUND=$(find .. -name "CMakeLists.txt" -not -path "*/build/*" -not -path "*/\.*" | head -n 1 | xargs dirname || echo "")
+          if [ ! -z "$CMAKE_DIR_FOUND" ]; then
+            CMAKE_DIR="$CMAKE_DIR_FOUND"
+            echo "Found CMakeLists.txt in $CMAKE_DIR"
+          fi
+        fi
+        
+        # Attempt CMake configuration and build
+        cmake "$CMAKE_DIR" -DCMAKE_BUILD_TYPE=Release -G Ninja || echo "CMake configuration failed, continuing anyway"
+        cmake --build . --config Release || echo "CMake build failed, continuing anyway"
+      continue-on-error: true
+
+    - name: Build with Autotools
+      if: steps.check_build.outputs.HAS_AUTOTOOLS == 'true'
+      run: |
+        # If autogen.sh exists, run it first
+        if [ -f "autogen.sh" ]; then
+          ./autogen.sh
+        fi
+        
+        # If configure.ac exists but no configure, run autoconf
+        if [ -f "configure.ac" ] && [ ! -f "configure" ]; then
+          autoreconf -i
+        fi
+        
+        # Run configure and make
+        if [ -f "configure" ]; then
+          ./configure
+          make
+        fi
+      continue-on-error: true
+
+    - name: Build with Make
+      if: steps.check_build.outputs.HAS_MAKEFILE == 'true'
+      run: |
+        make
+      continue-on-error: true
+
+    - name: Run tests
+      run: |
+        # Only attempt to run tests if the build directory exists and contains something
+        if [ -d "build" ] && [ "$(ls -A build)" ]; then
+          cd build
+          # Only run ctest if it's a CMake project
+          if [ -f "CTestTestfile.cmake" ]; then
+            ctest -C Release --output-on-failure || echo "Tests failed, continuing anyway"
+          else
+            echo "No CMake tests found, skipping test step"
+          fi
+        else
+          echo "Build directory empty or not created, skipping test step"
+        fi
+      continue-on-error: true
+
+    - name: Collect all dependencies
+      run: |
+        echo "# Dependency Report" > dependency_report.md
+        echo "Generated on $(date)" >> dependency_report.md
+        echo "" >> dependency_report.md
+        
+        # Create directory to store detailed dependency information
+        mkdir -p dependency_info
+        
+        echo "## System Dependencies" >> dependency_report.md
+        echo "Listing installed apt packages:" >> dependency_report.md
+        echo '```' >> dependency_report.md
+        dpkg-query -W -f='${binary:Package} ${Version}\n' | sort >> dependency_report.md
+        echo '```' >> dependency_report.md
+        
+        # Git Submodules Analysis
+        echo "" >> dependency_report.md
+        echo "## Git Submodules" >> dependency_report.md
+        if [ -f ".gitmodules" ]; then
+          echo "### Detected Git Submodules" >> dependency_report.md
+          echo '```' >> dependency_report.md
+          cat .gitmodules >> dependency_report.md
+          echo '```' >> dependency_report.md
+          
+          echo "" >> dependency_report.md
+          echo "### Submodule Versions (Commit Hashes)" >> dependency_report.md
+          echo '```' >> dependency_report.md
+          git submodule status >> dependency_report.md 2>/dev/null || echo "Could not get submodule status" >> dependency_report.md
+          echo '```' >> dependency_report.md
+          
+          # Try to get more detailed information from each submodule
+          echo "" >> dependency_report.md
+          echo "### Detailed Submodule Information" >> dependency_report.md
+          echo '```' >> dependency_report.md
+          git submodule foreach 'echo "Submodule: $name"; git log -n 1 --pretty=format:"%h %s %ad" --date=short; echo ""; if [ -f "VERSION" ]; then echo "VERSION file: $(cat VERSION)"; fi; if [ -f "version.txt" ]; then echo "version.txt: $(cat version.txt)"; fi; echo ""' 2>/dev/null || echo "Could not get detailed submodule info" >> dependency_report.md
+          echo '```' >> dependency_report.md
+        else
+          echo "No .gitmodules file found. Repository does not use git submodules." >> dependency_report.md
+        fi
+        
+        # Vendored Dependencies Analysis
+        echo "" >> dependency_report.md
+        echo "## Vendored Dependencies" >> dependency_report.md
+        
+        # Common directories where dependencies are vendored
+        echo "### Common Vendored Directories" >> dependency_report.md
+        echo '```' >> dependency_report.md
+        for DIR in vendor third_party external lib/vendor deps dependencies ext contrib ThirdParty; do
+          if [ -d "$DIR" ]; then
+            echo "Found potential vendored directory: $DIR" >> dependency_report.md
+            echo "Contents:" >> dependency_report.md
+            ls -la "$DIR" >> dependency_report.md
+            echo "" >> dependency_report.md
+          fi
+        done
+        echo '```' >> dependency_report.md
+        
+        # Install and use OSV scanner for detecting versions of vendored code, if available
+        echo "" >> dependency_report.md
+        echo "### OSV Version Detection" >> dependency_report.md
+        echo '```' >> dependency_report.md
+        python3 -m pip install --user osv 2>/dev/null || echo "Could not install OSV scanner" >> dependency_report.md
+        if command -v osv-scanner &> /dev/null; then
+          echo "Running OSV scanner to detect vendored package versions..." >> dependency_report.md
+          osv-scanner scan --recursive . >> dependency_report.md 2>/dev/null || echo "OSV scanner failed or found no results" >> dependency_report.md
+        else
+          echo "OSV scanner not available. Could not scan for vendored package versions." >> dependency_report.md
+        fi
+        echo '```' >> dependency_report.md
+        
+        # Look for version information in vendored directories
+        echo "" >> dependency_report.md
+        echo "### Version Information in Vendored Code" >> dependency_report.md
+        echo '```' >> dependency_report.md
+        # Search for version files, headers and other common version indicators
+        find . -path "*/vendor/*" -o -path "*/third_party/*" -o -path "*/external/*" -o -path "*/ThirdParty/*" -o -path "*/deps/*" | grep -E 'version\.h|VERSION|version\.txt|package\.json|setup\.py|\.gemspec|README|CHANGELOG|LICENSE' | while read -r file; do
+          if [ -f "$file" ]; then
+            echo "Examining $file for version information:" >> dependency_report.md
+            # Extract version information using various patterns
+            if [[ "$file" == *"version.h"* ]]; then
+              grep -E '#define.*VERSION|version|RELEASE' "$file" >> dependency_report.md 2>/dev/null || echo "No version defines found" >> dependency_report.md
+            elif [[ "$file" == *"package.json"* ]]; then
+              grep -E '"version"|"name"' "$file" >> dependency_report.md 2>/dev/null || echo "No version info found" >> dependency_report.md
+            elif [[ "$file" == *"setup.py"* ]]; then
+              grep -E "version|name" "$file" >> dependency_report.md 2>/dev/null || echo "No version info found" >> dependency_report.md
+            elif [[ "$file" == *".gemspec"* ]]; then
+              grep -E "version|name" "$file" >> dependency_report.md 2>/dev/null || echo "No version info found" >> dependency_report.md
+            elif [[ "$file" == *"VERSION"* || "$file" == *"version.txt"* ]]; then
+              cat "$file" >> dependency_report.md 2>/dev/null || echo "Could not read file" >> dependency_report.md
+            else
+              # For README, LICENSE, etc. just look for version mentions
+              head -n 20 "$file" | grep -i -E "version|release" >> dependency_report.md 2>/dev/null || echo "No obvious version info in header" >> dependency_report.md
+            fi
+            echo "" >> dependency_report.md
+          fi
+        done
+        echo '```' >> dependency_report.md
+        
+        # Use git history on vendored directories to find when they were last updated
+        echo "" >> dependency_report.md
+        echo "### Git History for Vendored Directories" >> dependency_report.md
+        echo '```' >> dependency_report.md
+        for DIR in vendor third_party external lib/vendor deps dependencies ext contrib ThirdParty; do
+          if [ -d "$DIR" ]; then
+            echo "Git history for $DIR:" >> dependency_report.md
+            git log -n 3 --pretty=format:"%h %s %ad" --date=short -- "$DIR" >> dependency_report.md 2>/dev/null || echo "Could not get git history" >> dependency_report.md
+            echo "" >> dependency_report.md
+            
+            # Check commits for specific directories inside vendored dirs
+            SUBDIRS=$(find "$DIR" -maxdepth 1 -type d | tail -n +2)
+            for SUBDIR in $SUBDIRS; do
+              if [ -d "$SUBDIR" ]; then
+                echo "Last commit for $SUBDIR:" >> dependency_report.md
+                git log -n 1 --pretty=format:"%h %s %ad" --date=short -- "$SUBDIR" >> dependency_report.md 2>/dev/null || echo "Could not get git history" >> dependency_report.md
+                echo "" >> dependency_report.md
+              fi
+            done
+          fi
+        done
+        echo '```' >> dependency_report.md
+        
+        # CMake Dependencies section after the vendored dependencies analysis
+        echo "" >> dependency_report.md
+        echo "## CMake Dependencies" >> dependency_report.md
+        # Find all CMakeLists.txt files in the project, not just in the root
+        CMAKE_FILES=$(find . -name "CMakeLists.txt" -not -path "*/build/*" -not -path "*/\.*")
+        if [ ! -z "$CMAKE_FILES" ]; then
+          echo "### Direct CMake Dependencies" >> dependency_report.md
+          echo '```' >> dependency_report.md
+          # Extract and document all find_package and pkg_check_modules calls more thoroughly
+          for CMAKE_FILE in $CMAKE_FILES; do
+            echo "File: $CMAKE_FILE" >> dependency_report.md
+            {
+              grep -n "find_package" "$CMAKE_FILE" || echo "No find_package found"
+              grep -n "pkg_check_modules" "$CMAKE_FILE" || echo "No pkg_check_modules found"
+            } >> dependency_report.md
+            echo "" >> dependency_report.md
+          done
+          echo '```' >> dependency_report.md
+          
+          # Try to get actual versions from CMake cache if build has run
+          if [ -f "build/CMakeCache.txt" ]; then
+            echo "" >> dependency_report.md
+            echo "### CMake Cache - Dependency Versions" >> dependency_report.md
+            echo '```' >> dependency_report.md
+            grep -E "_VERSION|_FOUND" build/CMakeCache.txt | sort >> dependency_report.md
+            echo '```' >> dependency_report.md
+            
+            # Save detailed cmake info
+            cp build/CMakeCache.txt dependency_info/
+            [ -f build/compile_commands.json ] && cp build/compile_commands.json dependency_info/
+          fi
+        else
+          echo "No CMakeLists.txt files found in the project." >> dependency_report.md
+        fi
+        
+        # Conan dependencies
+        if [ -f "conanfile.txt" ] || [ -f "conanfile.py" ]; then
+          echo "" >> dependency_report.md
+          echo "## Conan Dependencies" >> dependency_report.md
+          
+          echo "### Conan Direct Dependencies" >> dependency_report.md
+          echo '```' >> dependency_report.md
+          if [ -f "conanfile.txt" ]; then
+            cat conanfile.txt >> dependency_report.md
+          else
+            cat conanfile.py >> dependency_report.md
+          fi
+          echo '```' >> dependency_report.md
+          
+          echo "" >> dependency_report.md
+          echo "### Conan Dependency Graph" >> dependency_report.md
+          echo '```' >> dependency_report.md
+          # Try to run conan info but don't fail if it doesn't work
+          (cd build && conan info .. 2>/dev/null) >> dependency_report.md || echo "Could not generate Conan info" >> dependency_report.md
+          echo '```' >> dependency_report.md
+          
+          # Get Conan lock file if available
+          [ -f "build/conanbuildinfo.txt" ] && cp build/conanbuildinfo.txt dependency_info/
+          [ -f "build/conaninfo.txt" ] && cp build/conaninfo.txt dependency_info/
+        fi
+        
+        # vcpkg dependencies
+        if [ -f "vcpkg.json" ]; then
+          echo "" >> dependency_report.md
+          echo "## vcpkg Dependencies" >> dependency_report.md
+          echo "### vcpkg Direct Dependencies" >> dependency_report.md
+          echo '```json' >> dependency_report.md
+          cat vcpkg.json >> dependency_report.md
+          echo '```' >> dependency_report.md
+          
+          # If using vcpkg with CMake, try to extract more info
+          if [ -d "build/vcpkg_installed" ]; then
+            echo "" >> dependency_report.md
+            echo "### Installed vcpkg Packages" >> dependency_report.md
+            echo '```' >> dependency_report.md
+            find build/vcpkg_installed -name "CONTROL" -o -name "vcpkg_abi_info.txt" | xargs cat 2>/dev/null >> dependency_report.md || echo "No detailed vcpkg info found" >> dependency_report.md
+            echo '```' >> dependency_report.md
+          fi
+        fi
+        
+        # Check for Bazel
+        if [ -f "WORKSPACE" ] || [ -f "WORKSPACE.bazel" ] || [ -f "MODULE.bazel" ]; then
+          echo "" >> dependency_report.md
+          echo "## Bazel Dependencies" >> dependency_report.md
+          echo '```' >> dependency_report.md
+          # Extract dependencies from WORKSPACE or MODULE.bazel
+          {
+            [ -f "WORKSPACE" ] && cat WORKSPACE
+            [ -f "WORKSPACE.bazel" ] && cat WORKSPACE.bazel
+            [ -f "MODULE.bazel" ] && cat MODULE.bazel
+          } | grep -E "git_repository|http_archive|maven_jar|maven_install" >> dependency_report.md
+          echo '```' >> dependency_report.md
+        fi
+        
+        # Look for package.json (Node.js dependencies)
+        if [ -f "package.json" ]; then
+          echo "" >> dependency_report.md
+          echo "## Node.js Dependencies" >> dependency_report.md
+          echo '```json' >> dependency_report.md
+          cat package.json >> dependency_report.md
+          echo '```' >> dependency_report.md
+          
+          if [ -f "package-lock.json" ]; then
+            cp package-lock.json dependency_info/
+          fi
+        fi
+        
+        # Look for requirements.txt (Python dependencies)
+        if [ -f "requirements.txt" ]; then
+          echo "" >> dependency_report.md
+          echo "## Python Dependencies" >> dependency_report.md
+          echo "### Direct Dependencies (requirements.txt)" >> dependency_report.md
+          echo '```' >> dependency_report.md
+          cat requirements.txt >> dependency_report.md
+          echo '```' >> dependency_report.md
+          
+          # Try to generate pip freeze output if Python is used
+          echo "" >> dependency_report.md
+          echo "### Complete Python Environment" >> dependency_report.md
+          echo '```' >> dependency_report.md
+          pip freeze >> dependency_report.md 2>/dev/null || echo "Could not generate pip freeze output" >> dependency_report.md
+          echo '```' >> dependency_report.md
+        fi
+
+        # Check for Cargo.toml (Rust dependencies)
+        if [ -f "Cargo.toml" ]; then
+          echo "" >> dependency_report.md
+          echo "## Rust Dependencies" >> dependency_report.md
+          echo '```toml' >> dependency_report.md
+          cat Cargo.toml >> dependency_report.md
+          echo '```' >> dependency_report.md
+          
+          if [ -f "Cargo.lock" ]; then
+            echo "" >> dependency_report.md
+            echo "### Cargo.lock (Complete dependency tree)" >> dependency_report.md
+            cp Cargo.lock dependency_info/
+          fi
+        fi
+        
+        # Look for typical C/C++ dependency patterns in source code
+        echo "" >> dependency_report.md
+        echo "## Source Code Analysis" >> dependency_report.md
+        echo "### Include Statements" >> dependency_report.md
+        echo '```' >> dependency_report.md
+        find . -type f -name "*.c" -o -name "*.cpp" -o -name "*.h" -o -name "*.hpp" | xargs grep -l "#include" 2>/dev/null | head -n 50 | xargs grep "#include" 2>/dev/null | sort | uniq -c | sort -nr >> dependency_report.md 2>/dev/null || echo "No C/C++ includes found" >> dependency_report.md
+        echo '```' >> dependency_report.md
+        
+        # Look at shared library dependencies in compiled binaries
+        echo "" >> dependency_report.md
+        echo "## Binary Analysis" >> dependency_report.md
+        echo "### Shared Library Dependencies" >> dependency_report.md
+        echo '```' >> dependency_report.md
+        find . -type f -executable -not -path "*/\.*" | head -n 20 | xargs -I{} bash -c "echo 'File: {}'; ldd {} 2>/dev/null || echo 'Not a dynamic executable'" >> dependency_report.md 2>/dev/null || echo "No binaries found or ldd not available" >> dependency_report.md
+        echo '```' >> dependency_report.md
+        
+        # Create a compressed archive of all dependency information
+        tar -czf dependency_info.tar.gz dependency_info dependency_report.md
+        
+        echo "Dependency report generated at dependency_report.md"
+      continue-on-error: true
+        
+    - name: Upload dependency report
+      uses: actions/upload-artifact@v4
+      with:
+        name: dependency-report
+        path: |
+          dependency_report.md
+          dependency_info.tar.gz
