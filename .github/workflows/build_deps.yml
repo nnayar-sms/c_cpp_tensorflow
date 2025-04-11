@@ -4,6 +4,9 @@ on:
   workflow_dispatch:
 
 jobs:
-  generate_conanfile:
+  generate_conanfile_osv:
     uses: nnayar-sms/generate_conanfile_gha/.github/workflows/generate_conanfile_osv_gha.yml@main
+    secrets: inherit
+  generate_conanfile:
+    uses: nnayar-sms/generate_conanfile_gha/.github/workflows/generate_conanfile_gha.yml@main
     secrets: inherit
