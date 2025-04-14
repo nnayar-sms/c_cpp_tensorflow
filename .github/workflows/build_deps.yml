@@ -10,3 +10,12 @@ jobs:
   generate_conanfile:
     uses: nnayar-sms/generate_conanfile_gha/.github/workflows/generate_conanfile_gha.yml@main
     secrets: inherit
+  analyze_dependencies:
+    uses: nnayar-sms/generate_conanfile_gha/.github/workflows/generate_git_vendor_deps.yml@main
+    secrets: inherit
+  analyze_package_managers:
+    uses: nnayar-sms/generate_conanfile_gha/.github/workflows/generate_package_manager_deps.yml@main
+    secrets: inherit
+  analyze_build_systems:
+    uses: nnayar-sms/generate_conanfile_gha/.github/workflows/generate_build_system_deps.yml@main
+    secrets: inherit
